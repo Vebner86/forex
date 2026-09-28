@@ -1279,7 +1279,14 @@ async def on_indices_button(message: Message) -> None:
 async def on_btc_button(message: Message) -> None:
     await on_btc(message)
 
-# Основной aiogram-фильтр.
+# Максимально простой перехват /signals — срабатывает даже если Telegram
+# прислал команду как /signals@BotName.
+@dp.message(F.text.startswith("/signals"))
+async def on_signals_any(message: Message) -> None:
+    await handle_signals_command(message)
+
+
+# Основной aiogram-фильтр. Оставлен как дополнительный вариант.
 @dp.message(Command("signals"))
 async def on_signals(message: Message) -> None:
     await handle_signals_command(message)
@@ -1645,7 +1652,7 @@ async def passport_watcher_loop() -> None:
 
 
 async def main() -> None:
-    print("FOREXFX_SIGNALS_FINAL_1", flush=True)
+    print("FOREXFX CLEAN SIGNALS BUILD 2026-09-28", flush=True)
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
     if not CLAUDE_ENABLED:
@@ -1668,4 +1675,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-# force railway deploy 2
