@@ -9,3 +9,4 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY forex_bot.py .
 
 CMD ["python", "-u", "forex_bot.py"]
+
