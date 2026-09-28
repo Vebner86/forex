@@ -1262,41 +1262,32 @@ async def handle_signals_command(message: Message) -> None:
             await message.answer(msg, parse_mode="HTML")
 
 
-# Кнопка «📡 Сигналы» работает независимо от slash-команд Telegram.
+# Кнопка «📡 Сигналы»
 @dp.message(F.text == "📡 Сигналы")
 async def on_signals_button(message: Message) -> None:
     await handle_signals_command(message)
 
-@dp.message(F.text == "🔮 Прогноз")
-async def on_forecast_button(message: Message) -> None:
-    await on_forecast(message)
 
-@dp.message(F.text == "📈 Индексы")
-async def on_indices_button(message: Message) -> None:
-    await on_indices(message)
-
-@dp.message(F.text == "₿ Биткоин")
-async def on_btc_button(message: Message) -> None:
-    await on_btc(message)
-
-# Максимально простой перехват /signals — срабатывает даже если Telegram
-# прислал команду как /signals@BotName.
-@dp.message(F.text.startswith("/signals"))
-async def on_signals_any(message: Message) -> None:
-    await handle_signals_command(message)
-
-
-# Основной aiogram-фильтр. Оставлен как дополнительный вариант.
+# Единственный обработчик slash-команды /signals.
+# Он отвечает сразу, до обращения к Twelve Data.
 @dp.message(Command("signals"))
 async def on_signals(message: Message) -> None:
     await handle_signals_command(message)
 
 
-# Запасной фильтр для клиентов Telegram, которые присылают /signals с @botname
-# или по иной причине не проходят Command-фильтр.
-@dp.message(F.text.regexp(r"(?i)^/signals(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"))
-async def on_signals_fallback(message: Message) -> None:
-    await handle_signals_command(message)
+@dp.message(F.text == "🔮 Прогноз")
+async def on_forecast_button(message: Message) -> None:
+    await on_forecast(message)
+
+
+@dp.message(F.text == "📈 Индексы")
+async def on_indices_button(message: Message) -> None:
+    await on_indices(message)
+
+
+@dp.message(F.text == "₿ Биткоин")
+async def on_btc_button(message: Message) -> None:
+    await on_btc(message)
 
 
 @dp.message(Command("forecast"))
@@ -1652,7 +1643,7 @@ async def passport_watcher_loop() -> None:
 
 
 async def main() -> None:
-    print("FOREXFX CLEAN SIGNALS BUILD 2026-09-28", flush=True)
+    print("FOREXFX SIGNALS FIX BUILD 2026-09-28-2359", flush=True)
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
     if not CLAUDE_ENABLED:
