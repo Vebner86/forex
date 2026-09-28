@@ -105,6 +105,18 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_ENABLED = bool(ANTHROPIC_API_KEY)
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
+# Рыночный сканер: реальные OHLC-свечи Twelve Data.
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+SIGNAL_SCAN_INTERVAL = 15 * 60  # API вызываем максимум раз в 15 минут
+SIGNAL_SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
+SIGNAL_TIMEFRAMES = ("1h", "4h")
+SIGNAL_LOOKBACK = 10            # sweep экстремума предыдущих 10 свечей
+SIGNAL_EMA_PERIOD = 50          # фильтр направления
+SIGNAL_ATR_PERIOD = 14
+SIGNAL_RR = 2.0                 # историческая проверка TP = 2R
+SIGNAL_MAX_HOLD_BARS = 20       # максимум 20 свечей на исход сделки
+
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 RSS_FEEDS = [
     "https://www.forexlive.com/feed/news",
@@ -174,6 +186,7 @@ DATA_DIR = Path(__file__).parent
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
 STATE_FILE = DATA_DIR / "daily_state.json"
 PASSPORT_SUBSCRIBERS_FILE = DATA_DIR / "passport_subscribers.json"
+SIGNAL_STATE_FILE = DATA_DIR / "market_signal_state.json"
 
 PASSPORT_URL = "https://warszawa.pasport.org.ua/solutions/e-queue"
 PASSPORT_SERVICE_LABEL = "Закордонний паспорт"  # пункт в списке "Послуга *"
@@ -953,6 +966,248 @@ def pairs_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ---------- Рыночный сигнальщик: Liquidity Sweep + Rejection ----------
+
+def _f(value) -> float:
+    return float(value)
+
+
+def _ema(values: list[float], period: int) -> list[float | None]:
+    out: list[float | None] = [None] * len(values)
+    if len(values) < period:
+        return out
+    seed = sum(values[:period]) / period
+    out[period - 1] = seed
+    k = 2 / (period + 1)
+    prev = seed
+    for i in range(period, len(values)):
+        prev = values[i] * k + prev * (1 - k)
+        out[i] = prev
+    return out
+
+
+def _atr(candles: list[dict], period: int = SIGNAL_ATR_PERIOD) -> list[float | None]:
+    trs: list[float] = []
+    for i, c in enumerate(candles):
+        if i == 0:
+            tr = c["high"] - c["low"]
+        else:
+            pc = candles[i - 1]["close"]
+            tr = max(c["high"] - c["low"], abs(c["high"] - pc), abs(c["low"] - pc))
+        trs.append(tr)
+    out: list[float | None] = [None] * len(candles)
+    for i in range(period - 1, len(candles)):
+        out[i] = sum(trs[i - period + 1:i + 1]) / period
+    return out
+
+
+async def fetch_twelve_1h(symbol: str, outputsize: int = 5000) -> list[dict]:
+    """Получает 1H OHLC в UTC. Последнюю незакрытую свечу отбрасываем."""
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY не задан")
+    params = {
+        "symbol": symbol,
+        "interval": "1h",
+        "outputsize": outputsize,
+        "timezone": "UTC",
+        "order": "asc",
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(TWELVE_DATA_URL, params=params, timeout=25) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    if data.get("status") == "error" or "values" not in data:
+        raise RuntimeError(data.get("message") or f"Twelve Data: {data}")
+    now = datetime.now(timezone.utc)
+    candles = []
+    for v in data["values"]:
+        dt = datetime.fromisoformat(v["datetime"]).replace(tzinfo=timezone.utc)
+        if dt + timedelta(hours=1) > now:
+            continue
+        candles.append({
+            "dt": dt,
+            "open": _f(v["open"]), "high": _f(v["high"]),
+            "low": _f(v["low"]), "close": _f(v["close"]),
+        })
+    return candles
+
+
+def aggregate_4h(candles: list[dict]) -> list[dict]:
+    """Собирает 4H из 1H, границы 00/04/08/12/16/20 UTC; только полные блоки."""
+    groups: dict[datetime, list[dict]] = {}
+    for c in candles:
+        dt = c["dt"]
+        start = dt.replace(hour=(dt.hour // 4) * 4, minute=0, second=0, microsecond=0)
+        groups.setdefault(start, []).append(c)
+    out = []
+    for start in sorted(groups):
+        g = sorted(groups[start], key=lambda x: x["dt"])
+        if len(g) != 4 or [x["dt"].hour for x in g] != [(start.hour + i) % 24 for i in range(4)]:
+            continue
+        out.append({"dt": start, "open": g[0]["open"], "high": max(x["high"] for x in g),
+                    "low": min(x["low"] for x in g), "close": g[-1]["close"]})
+    return out
+
+
+def detect_sweep(candles: list[dict], i: int) -> dict | None:
+    """Объективная модель: sweep предыдущего N-bar high/low + возврат + EMA50."""
+    if i < max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD):
+        return None
+    closes = [c["close"] for c in candles]
+    emas = _ema(closes, SIGNAL_EMA_PERIOD)
+    atrs = _atr(candles)
+    c = candles[i]
+    rng = c["high"] - c["low"]
+    if rng <= 0 or emas[i] is None or atrs[i] is None:
+        return None
+    prev = candles[i - SIGNAL_LOOKBACK:i]
+    prev_high = max(x["high"] for x in prev)
+    prev_low = min(x["low"] for x in prev)
+    close_pos = (c["close"] - c["low"]) / rng
+
+    # SHORT: забрали ликвидность сверху, вернулись под уровень, закрытие в нижних 45% свечи,
+    # и цена ниже EMA50 (фильтр направления).
+    if c["high"] > prev_high and c["close"] < prev_high and close_pos <= 0.45 and c["close"] < emas[i]:
+        entry = c["close"]
+        stop = c["high"] + 0.10 * atrs[i]
+        risk = stop - entry
+        if risk > 0:
+            return {"side": "SHORT", "level": prev_high, "extreme": c["high"], "entry": entry,
+                    "stop": stop, "target": entry - SIGNAL_RR * risk, "risk": risk}
+
+    # LONG — зеркально.
+    if c["low"] < prev_low and c["close"] > prev_low and close_pos >= 0.55 and c["close"] > emas[i]:
+        entry = c["close"]
+        stop = c["low"] - 0.10 * atrs[i]
+        risk = entry - stop
+        if risk > 0:
+            return {"side": "LONG", "level": prev_low, "extreme": c["low"], "entry": entry,
+                    "stop": stop, "target": entry + SIGNAL_RR * risk, "risk": risk}
+    return None
+
+
+def backtest_sweeps(candles: list[dict]) -> dict:
+    """Консервативный backtest: если SL и TP внутри одной свечи — считаем SL первым."""
+    results = []
+    start = max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD)
+    for i in range(start, len(candles) - 1):
+        sig = detect_sweep(candles, i)
+        if not sig:
+            continue
+        outcome = None
+        for j in range(i + 1, min(len(candles), i + 1 + SIGNAL_MAX_HOLD_BARS)):
+            b = candles[j]
+            if sig["side"] == "LONG":
+                stop_hit, tp_hit = b["low"] <= sig["stop"], b["high"] >= sig["target"]
+            else:
+                stop_hit, tp_hit = b["high"] >= sig["stop"], b["low"] <= sig["target"]
+            if stop_hit:  # консервативно при одновременном касании
+                outcome = -1.0
+                break
+            if tp_hit:
+                outcome = SIGNAL_RR
+                break
+        if outcome is not None:
+            results.append(outcome)
+    wins = [r for r in results if r > 0]
+    losses = [r for r in results if r < 0]
+    gross_win, gross_loss = sum(wins), abs(sum(losses))
+    pf = gross_win / gross_loss if gross_loss else (999.0 if gross_win else 0.0)
+    equity = peak = max_dd = 0.0
+    for r in results:
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    return {
+        "trades": len(results), "win_rate": (100 * len(wins) / len(results)) if results else 0.0,
+        "pf": pf, "avg_r": (sum(results) / len(results)) if results else 0.0, "max_dd_r": max_dd,
+    }
+
+
+def _price(v: float, symbol: str) -> str:
+    if "JPY" in symbol:
+        return f"{v:.3f}"
+    if "XAU" in symbol:
+        return f"{v:.2f}"
+    return f"{v:.5f}"
+
+
+def signal_message(symbol: str, tf: str, candle: dict, sig: dict, stats: dict) -> str:
+    side_emoji = "🟢" if sig["side"] == "LONG" else "🔴"
+    return (
+        f"{side_emoji} <b>{symbol} · {sig['side']} · {tf.upper()}</b>\n"
+        f"Модель: Liquidity Sweep + Rejection + EMA50\n"
+        f"Свеча: {candle['dt'].strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"Снят уровень: {_price(sig['level'], symbol)} | экстремум: {_price(sig['extreme'], symbol)}\n"
+        f"Закрытие / вход: <b>{_price(sig['entry'], symbol)}</b>\n\n"
+        f"🛑 SL: {_price(sig['stop'], symbol)}\n"
+        f"🎯 TP (2R): {_price(sig['target'], symbol)}\n\n"
+        f"📊 <b>История на загруженных свечах</b>\n"
+        f"Сделок: {stats['trades']} | Win rate: {stats['win_rate']:.1f}%\n"
+        f"PF: {stats['pf']:.2f} | Avg: {stats['avg_r']:+.2f}R | Max DD: {stats['max_dd_r']:.1f}R\n"
+        f"<i>Статистика не гарантирует будущий результат.</i>"
+    )
+
+
+def load_signal_state() -> dict:
+    return load_json(SIGNAL_STATE_FILE, {"sent": []})
+
+
+def save_signal_state(state: dict) -> None:
+    # Не даём файлу бесконечно расти.
+    state["sent"] = state.get("sent", [])[-500:]
+    save_json(SIGNAL_STATE_FILE, state)
+
+
+async def scan_market_signals(send: bool = True) -> list[str]:
+    """Один проход по 4 инструментам. 4H строим локально, поэтому всего 4 API-запроса."""
+    if not TWELVE_DATA_API_KEY:
+        return []
+    state = load_signal_state()
+    sent = set(state.get("sent", []))
+    found: list[str] = []
+    for symbol in SIGNAL_SYMBOLS:
+        try:
+            h1 = await fetch_twelve_1h(symbol)
+            datasets = {"1h": h1, "4h": aggregate_4h(h1)}
+            for tf, candles in datasets.items():
+                if len(candles) < SIGNAL_EMA_PERIOD + 5:
+                    continue
+                i = len(candles) - 1
+                sig = detect_sweep(candles, i)
+                if not sig:
+                    continue
+                key = f"{symbol}|{tf}|{candles[i]['dt'].isoformat()}|{sig['side']}"
+                if key in sent:
+                    continue
+                stats = backtest_sweeps(candles)
+                msg = signal_message(symbol, tf, candles[i], sig, stats)
+                found.append(msg)
+                if send:
+                    await send_to_subscribers(msg)
+                    sent.add(key)
+        except Exception:
+            logger.exception(f"Ошибка market scanner: {symbol}")
+    state["sent"] = list(sent)
+    save_signal_state(state)
+    return found
+
+
+async def market_signal_loop() -> None:
+    if not TWELVE_DATA_API_KEY:
+        logger.warning("TWELVE_DATA_API_KEY не задан — market scanner отключён")
+        return
+    # Небольшая пауза после старта Railway, затем постоянный скан.
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await scan_market_signals(send=True)
+        except Exception:
+            logger.exception("Ошибка цикла market scanner")
+        await asyncio.sleep(SIGNAL_SCAN_INTERVAL)
+
+
 # ---------- Хендлеры бота ----------
 
 @dp.message(CommandStart())
@@ -966,6 +1221,20 @@ async def on_start(message: Message) -> None:
         return
     events = filter_today(raw_events, ("High", "Medium"))
     await message.answer(format_calendar_summary(events), parse_mode="HTML")
+
+
+@dp.message(Command("signals"))
+async def on_signals(message: Message) -> None:
+    if not TWELVE_DATA_API_KEY:
+        await message.answer("TWELVE_DATA_API_KEY не настроен — сканер сигналов выключен.")
+        return
+    await message.answer("🔎 Проверяю EUR/USD, GBP/USD, USD/JPY и XAU/USD на 1H/4H...")
+    found = await scan_market_signals(send=False)
+    if not found:
+        await message.answer("Сейчас новой подтверждённой модели Liquidity Sweep + Rejection нет.")
+    else:
+        for msg in found:
+            await message.answer(msg, parse_mode="HTML")
 
 
 @dp.message(Command("forecast"))
@@ -1269,6 +1538,7 @@ async def scheduler_loop() -> None:
 BOT_COMMANDS = [
     BotCommand(command="start", description="Подписаться и получить сводку на сегодня"),
     BotCommand(command="forecast", description="Быстрый прогноз по валютам, золоту, нефти, индексам"),
+    BotCommand(command="signals", description="Проверить торговые сигналы 1H/4H"),
     BotCommand(command="pairs", description="Кнопки: анализ по валютной паре"),
     BotCommand(command="indices", description="Кнопки: DAX 40 / Nasdaq / S&P 500"),
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
@@ -1327,6 +1597,7 @@ async def main() -> None:
     await bot.set_my_commands(BOT_COMMANDS)
     asyncio.create_task(scheduler_loop())
     asyncio.create_task(passport_watcher_loop())
+    asyncio.create_task(market_signal_loop())
     await dp.start_polling(bot)
 
 
