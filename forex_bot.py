@@ -1,78 +1,61 @@
 """
-Telegram-бот: форекс-сводка + прогнозы перед важными релизами.
+Telegram-бот: форекс-сводка + прогнозы перед важными релизами + сканер сигналов.
 
 Логика (проверяется раз в 5 минут, но реально что-то делает только по расписанию):
 1. Каждый день бот смотрит календарь (ForexFactory) на сегодня.
 2. Если сегодня ЕСТЬ важные (High impact) релизы по основным валютам:
-   - за 1 час до КАЖДОГО такого релиза бот присылает прогноз-предположение:
-     как обычно эта статистика влияет на валюту, чего ждёт рынок (по
-     прогнозу/предыдущему значению) и что будет, если факт выйдет выше/ниже
-     ожиданий — с учётом свежих новостных заголовков за последние часы.
+   - за 1 час до КАЖДОГО такого релиза бот присылает прогноз-предположение.
    - ИСКЛЮЧЕНИЕ: за 1 час до Non-Farm Payrolls (NFP) — отдельный расширенный
-     разбор (не 3 предложения, а до 6 структурированных пунктов): ожидания
-     по вторичным показателям (безработица, зарплаты), связь с ожиданиями по
-     ставке ФРС, сценарии "лучше/хуже/в рамках прогноза" отдельно для
-     USD/золота/S&P 500, и риск пересмотра прошлых месяцев. NFP — самый
-     влиятельный макрорелиз месяца, поэтому для него единственного делается
-     исключение из принципа "коротко и по делу".
+     разбор (не 3 предложения, а до 6 структурированных пунктов).
 3. Если сегодня важных релизов НЕТ:
    - один раз, перед открытием NYSE (9:30 по Нью-Йорку), присылает общую
-     сводку факторов, которые могут повлиять на рынок сегодня, на основе
-     последних новостных заголовков.
+     сводку факторов, которые могут повлиять на рынок сегодня.
 4. /start подписывает на уведомления и сразу присылает сводку календаря на
-   сегодня. Команда /forecast — по запросу короткий прогноз-настроение
-   (бычье/медвежье/нейтральное) по каждой из основных валют, золоту, нефти
-   и индексам (DAX 40, Nasdaq, S&P 500). Команда /btc — отдельный разбор
-   биткоина с зонами поддержки/сопротивления. Команда /pairs — кнопки с
-   популярными парами (EUR/USD, GBP/USD и т.д.), по нажатию — короткий
-   анализ по этой паре с реальными ценовыми уровнями (ЕЦБ-курсы для фиатных
-   пар, Coinbase для BTC) и позиционированием крупных трейдеров (COT-отчёты
-   CFTC). Команда /indices — кнопки DAX 40 / Nasdaq / S&P 500. Команда
-   /news — дайджест из двух блоков: «Главное» (что реально произошло, по
-   фактам) и «Что это может значить» (короткий вывод). Команда /ask <вопрос>
-   или просто обычное сообщение без команды — бот ответит на любой вопрос
-   с учётом свежих заголовков как контекста.
+   сегодня. /forecast, /btc, /pairs, /indices, /news, /ask — см. описания
+   команд в BOT_COMMANDS ниже. /signals — сканер модели Liquidity Sweep +
+   Rejection по EUR/USD, GBP/USD, USD/JPY, XAU/USD на 1H/4H (требует
+   TWELVE_DATA_API_KEY).
 
-Защита от устаревших фактов: у Claude есть дата отсечки обучающих данных, и
-он может "помнить" неактуальную информацию (например, кто занимает пост главы
-центробанка). Поэтому в каждый запрос автоматически добавляется инструкция не
-называть людей по имени, если оно не упомянуто в переданных актуальных
-данных/заголовках — только опираться на то, что реально пришло с новостями.
+Защита от устаревших фактов: у Claude есть дата отсечки обучающих данных —
+в каждый запрос автоматически добавляется инструкция не называть людей по
+имени, если оно не упомянуто в переданных актуальных данных/заголовках.
 
 Источники данных:
-- Экономический календарь: ForexFactory (нюфид, кэш 15 мин).
+- Экономический календарь: ForexFactory (кэш 15 мин).
 - Новости: ForexLive, FXStreet, Investing.com, DailyFX, TradingEconomics,
-  Oilprice, Kitco, MarketWatch, CNBC + официальные пресс-релизы ФРС, ЕЦБ,
-  Банка Англии.
+  Oilprice, Kitco, MarketWatch, CNBC + пресс-релизы ФРС, ЕЦБ, Банка Англии.
 - Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
 - Цена BTC: Coinbase (без ключа).
 - Индексы (DAX 40, Nasdaq, S&P 500): Yahoo Finance chart API (без ключа).
-- Позиционирование трейдеров: CFTC Commitment of Traders (публичные данные,
-  обновляются раз в неделю, по пятницам).
+- Позиционирование трейдеров: CFTC Commitment of Traders (раз в неделю).
+- Свечи для сканера сигналов: Twelve Data (НУЖЕН ключ, см. ниже).
 
 ВАЖНО: это фоновый процесс, должен работать круглосуточно на чём-то always-on
 (VPS/сервер), не на ноутбуке, который выключается.
 
 Нужные вводные:
-1. BOT_TOKEN         — токен от @BotFather (обязателен).
-2. ANTHROPIC_API_KEY — ключ с platform.claude.com (опционален). Без него бот
-   всё равно работает: календарь по /start и сырые цифры по расписанию
-   отправляются как обычно, просто вместо AI-анализа (прогноз-предположение,
-   сводка перед NYSE, /forecast) будет пометка, что AI недоступен, и сырые
-   данные без интерпретации. Как только ключ появится — просто добавь
-   переменную окружения и перезапусти бота, код менять не нужно.
-3. CLAUDE_MODEL      — необязательно, по умолчанию "claude-haiku-4-5-20251001"
-   (дешёвая модель). Чтобы попробовать более сильную — задай в переменных
-   окружения, например "claude-sonnet-4-6". Учти: Sonnet примерно в 3 раза
-   дороже за токен, чем Haiku.
+1. BOT_TOKEN          — токен от @BotFather (обязателен).
+2. ANTHROPIC_API_KEY  — ключ с platform.claude.com (опционален). Без него бот
+   всё равно работает: календарь и сырые цифры отправляются как обычно,
+   просто вместо AI-анализа будет пометка, что AI недоступен, и сырые данные
+   без интерпретации.
+3. CLAUDE_MODEL       — необязательно, по умолчанию "claude-haiku-4-5-20251001".
+4. TWELVE_DATA_API_KEY — ОБЯЗАТЕЛЕН для сканера сигналов (/signals и фоновый
+   market_signal_loop). Без него /signals прямо отвечает, что сканер выключен,
+   а фоновый цикл сигналов вообще не запускается. Получить ключ: регистрация
+   на twelvedata.com, бесплатный план обычно даёт форекс-пары; XAU/USD
+   (золото) на части бесплатных планов может быть недоступен — если именно
+   по золоту сигналы никогда не приходят и в логах ошибка авторизации/плана
+   именно для XAU/USD, это ожидаемо для бесплатного тарифа.
 
 Зависимости (requirements.txt):
-    aiogram, aiohttp, feedparser, anthropic
+    aiogram, aiohttp, feedparser, anthropic, deep-translator, tzdata
 
 Запуск:
     pip install -r requirements.txt
     export BOT_TOKEN="..."
     export ANTHROPIC_API_KEY="..."
+    export TWELVE_DATA_API_KEY="..."
     python forex_bot.py
 """
 
@@ -118,7 +101,6 @@ RSS_FEEDS = [
     "https://www.kitco.com/rss/KitcoNews.xml",
     "https://www.dailyfx.com/feeds/all",
     "https://tradingeconomics.com/rss/news.aspx",
-    # официальные пресс-релизы центробанков — первичный источник, не пересказ
     "https://www.federalreserve.gov/feeds/press_all.xml",
     "https://www.ecb.europa.eu/rss/press.xml",
     "https://www.bankofengland.co.uk/rss/news",
@@ -136,7 +118,6 @@ COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_cha
 COINBASE_STATS_URL = "https://api.exchange.coinbase.com/products/BTC-USD/stats"
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400"
 
-# Фондовые индексы через Yahoo Finance chart API (бесплатно, без ключа)
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=3mo&interval=1d"
 INDEX_ASSETS = {
     "DAX40": {"symbol": "^GDAXI", "label": "DAX 40"},
@@ -144,10 +125,8 @@ INDEX_ASSETS = {
     "SP500": {"symbol": "^GSPC", "label": "S&P 500"},
 }
 
-# Курсы фиатных валют (ЕЦБ через Frankfurter.app — бесплатно, без ключа)
 FRANKFURTER_URL = "https://api.frankfurter.app/{start}..{end}"
 
-# COT-отчёты CFTC (позиционирование крупных спекулянтов по фьючерсам, раз в неделю)
 COT_DATASET_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
 COT_CONTRACT_NAMES = {
     "EUR": "EURO FX",
@@ -160,19 +139,18 @@ COT_CONTRACT_NAMES = {
 }
 COT_CACHE_TTL = timedelta(days=1)
 
-CALENDAR_CACHE_TTL = timedelta(minutes=15)  # чтобы не ловить 429 от ForexFactory
+CALENDAR_CACHE_TTL = timedelta(minutes=15)
 
 MAJOR_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"}
 IMPACT_EMOJI = {"High": "🔴", "Medium": "🟠", "Low": "🟡", "Holiday": "⚪️"}
 
-# Популярные пары для /pairs (кнопки) и /pair (текстом)
 POPULAR_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD", "XAUUSD", "BTCUSD"]
 
 NY_TZ = ZoneInfo("America/New_York")
 NYSE_OPEN = time(9, 30)
-PRE_EVENT_LEAD = timedelta(hours=1)   # прогноз за час до важного релиза
-PRE_NYSE_LEAD = timedelta(minutes=30)  # сводка за 30 мин до открытия NYSE
-POLL_INTERVAL = 5 * 60  # как часто "просыпаться" и сверяться с расписанием
+PRE_EVENT_LEAD = timedelta(hours=1)
+PRE_NYSE_LEAD = timedelta(minutes=30)
+POLL_INTERVAL = 5 * 60
 
 DATA_DIR = Path(__file__).parent
 SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
@@ -184,7 +162,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _calendar_cache: dict = {"data": None, "fetched_at": None}
-_cot_cache: dict = {}  # currency -> (fetched_at, data)
+_cot_cache: dict = {}
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -214,13 +192,7 @@ def add_subscriber(chat_id: int) -> None:
         save_json(SUBSCRIBERS_FILE, list(subs))
 
 
-
-
 def load_state() -> dict:
-    """Сброс по нью-йоркской дате (не по UTC/серверной!) — иначе UTC-полночь
-    (02:00 в Варшаве летом) приходится на середину нью-йоркского дня, флаг
-    "сводка отправлена" сбрасывается раньше времени, и условие "уже после
-    открытия NYSE" тут же оказывается истинным — бот стреляет посреди ночи."""
     state = load_json(STATE_FILE, {})
     today_str = datetime.now(NY_TZ).date().isoformat()
     if state.get("date") != today_str:
@@ -243,8 +215,6 @@ def parse_event_time(raw: str):
 
 
 async def fetch_calendar() -> list[dict]:
-    """Кэшируем на CALENDAR_CACHE_TTL, чтобы частые /start и планировщик не
-    ловили 429 Too Many Requests от ForexFactory."""
     now = datetime.now(timezone.utc)
     if _calendar_cache["data"] is not None and now - _calendar_cache["fetched_at"] < CALENDAR_CACHE_TTL:
         return _calendar_cache["data"]
@@ -304,7 +274,6 @@ def fetch_equity_headlines(limit: int = 10) -> list[str]:
 
 
 def fetch_all_headlines(limit: int = 20) -> list[str]:
-    """Объединённый пул для дайджеста новостей: форекс/макро + акции + крипто."""
     combined = RSS_FEEDS + EQUITY_RSS_FEEDS + CRYPTO_RSS_FEEDS
     return _fetch_rss_headlines(combined, limit)
 
@@ -321,10 +290,6 @@ def _fetch_rss_headlines(feeds: list[str], limit: int) -> list[str]:
 
 
 def translate_to_ru(texts: list[str]) -> list[str]:
-    """Бесплатный перевод заголовков на русский для fallback-режима (без
-    Claude). Используется только когда ANTHROPIC_API_KEY не настроен —
-    Claude сам прекрасно читает английские заголовки и в переводе не
-    нуждается."""
     if not texts:
         return texts
     try:
@@ -335,7 +300,7 @@ def translate_to_ru(texts: list[str]) -> list[str]:
         return texts
 
 
-# ---------- Технические индикаторы (считаем сами, без сторонних либ) ----------
+# ---------- Технические индикаторы ----------
 
 def compute_rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) < period + 1:
@@ -391,11 +356,9 @@ def format_technicals(tech: dict, decimals: int = 2) -> str:
     return f"{rsi_line}\n{ma_line}"
 
 
-# ---------- Данные по биткоину (реальные цены, не выдумка) ----------
+# ---------- Данные по биткоину ----------
 
 async def fetch_btc_market_data() -> dict:
-    """Coinbase вместо Binance: Binance отдаёт 451 (гео-блок) для многих
-    облачных провайдеров (Railway/Render и т.п.), Coinbase — обычно нет."""
     headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession(headers=headers) as session:
         async with session.get(COINBASE_STATS_URL, timeout=15) as resp:
@@ -403,13 +366,13 @@ async def fetch_btc_market_data() -> dict:
             stats = await resp.json()
         async with session.get(COINBASE_CANDLES_URL, timeout=15) as resp:
             resp.raise_for_status()
-            candles = await resp.json()  # [time, low, high, open, close, volume], новые сначала
+            candles = await resp.json()
 
     current_price = float(stats["last"])
     open_price = float(stats.get("open") or current_price)
     change_24h = ((current_price - open_price) / open_price * 100) if open_price else 0.0
 
-    candles_asc = list(reversed(candles))  # делаем от старых к новым
+    candles_asc = list(reversed(candles))
     highs = [float(c[2]) for c in candles_asc]
     lows = [float(c[1]) for c in candles_asc]
     closes = [float(c[4]) for c in candles_asc]
@@ -438,11 +401,11 @@ def format_btc_raw(data: dict) -> str:
     return base + "\n" + format_technicals(data, decimals=0)
 
 
-# ---------- Фондовые индексы (Yahoo Finance, бесплатно, без ключа) ----------
+# ---------- Фондовые индексы ----------
 
 async def fetch_index_data(symbol: str) -> dict:
     url = YAHOO_CHART_URL.format(symbol=symbol)
-    headers = {"User-Agent": "Mozilla/5.0"}  # Yahoo иногда блокирует запросы без UA
+    headers = {"User-Agent": "Mozilla/5.0"}
     async with aiohttp.ClientSession(headers=headers) as session:
         async with session.get(url, timeout=15) as resp:
             resp.raise_for_status()
@@ -479,12 +442,9 @@ def format_index_raw(label: str, data: dict) -> str:
     return base + "\n" + format_technicals(data, decimals=0)
 
 
-# ---------- Реальные курсы фиатных валютных пар (ЕЦБ-данные, бесплатно) ----------
+# ---------- Реальные курсы фиатных валютных пар ----------
 
 async def fetch_fx_price_data(base: str, quote: str) -> dict | None:
-    """Курс + технические индикаторы по официальным дневным курсам ЕЦБ.
-    Работает только для пар из двух фиатных валют (не XAU/BTC). Берём ~4
-    месяца (ЕЦБ публикует только по рабочим дням) — с запасом для MA50."""
     if base in ("XAU", "BTC") or quote in ("XAU", "BTC"):
         return None
     end = date.today()
@@ -524,15 +484,7 @@ def format_fx_raw(data: dict) -> str:
     return base + "\n" + format_technicals(data, decimals=4)
 
 
-
-
-
-
 async def fetch_cot_positioning(currency: str) -> dict | None:
-    """Данные CFTC по фьючерсам на валюту — во сколько лонгов/шортов сидят
-    крупные спекулянты (non-commercial). Обновляется раз в неделю (пятница),
-    поэтому кэшируем на сутки. Для USD/XAU/BTC не считается — нет прямого
-    фьючерса на "доллар" в этом отчёте."""
     name = COT_CONTRACT_NAMES.get(currency)
     if not name:
         return None
@@ -623,8 +575,7 @@ FedWatch, риторику членов ФРС в последние дни, д�
 - Сценарий "значительно лучше прогноза" — что вероятно с USD, золотом, S&P 500
 - Сценарий "значительно хуже прогноза" — что вероятно с USD, золотом, S&P 500
 - Сценарий "около прогноза" — вероятна ли волатильность всё равно
-- Один рискованный момент, на который стоит обратить внимание (пересмотры
-  прошлых месяцев часто двигают рынок сильнее самой цифры)
+- Один рискованный момент, на который стоит обратить внимание
 
 Без вступлений и дисклеймеров, только конкретика. Если по какому-то пункту
 в заголовках нет данных — пропусти его, не выдумывай."""
@@ -766,10 +717,6 @@ PAIR_PROMPT = """Ты аналитик форекс-рынка. Валютная
 
 NO_KEY_NOTICE = "🤖 <i>AI-анализ пока недоступен (ANTHROPIC_API_KEY не настроен/не оплачен) — ниже сырые данные без интерпретации.</i>\n\n"
 
-# Критично: у Claude есть обучающие данные с определённой датой отсечки, и он
-# может "помнить" устаревшую информацию о том, кто занимает пост (главы
-# центробанков, президенты и т.п.). Эта инструкция заставляет его опираться
-# только на переданные в промпте актуальные данные, а не на свою "память".
 FACTUAL_GUARD = (
     "\n\nВАЖНО: не полагайся на собственные знания о том, кто СЕЙЧАС занимает "
     "должности (главы центробанков, президенты, министры и т.п.) — эта "
@@ -781,8 +728,6 @@ FACTUAL_GUARD = (
 
 
 async def ask_claude(prompt: str, fallback: str, max_tokens: int = 500) -> str:
-    """Возвращает ответ Claude, если ключ настроен, иначе — заглушку fallback
-    с пометкой, что AI-анализ временно недоступен."""
     if not CLAUDE_ENABLED:
         return NO_KEY_NOTICE + fallback
     guarded_prompt = prompt + FACTUAL_GUARD.format(today=date.today().isoformat())
@@ -809,7 +754,6 @@ async def send_to_subscribers(text: str) -> None:
 # ---------- Анализ по конкретной валютной паре ----------
 
 def parse_pair(raw: str) -> tuple[str, str] | None:
-    """Принимает 'EURUSD', 'EUR/USD', 'eur usd' и т.п., возвращает (base, quote)."""
     cleaned = raw.strip().upper().replace("/", "").replace(" ", "").replace("-", "")
     if len(cleaned) != 6:
         return None
@@ -936,7 +880,6 @@ def _atr(candles: list[dict], period: int = SIGNAL_ATR_PERIOD) -> list[float | N
 
 
 async def fetch_twelve_1h(symbol: str, outputsize: int = 5000) -> list[dict]:
-    """Получает 1H OHLC в UTC. Последнюю незакрытую свечу отбрасываем."""
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError("TWELVE_DATA_API_KEY не задан")
     params = {
@@ -968,7 +911,6 @@ async def fetch_twelve_1h(symbol: str, outputsize: int = 5000) -> list[dict]:
 
 
 def aggregate_4h(candles: list[dict]) -> list[dict]:
-    """Собирает 4H из 1H, границы 00/04/08/12/16/20 UTC; только полные блоки."""
     groups: dict[datetime, list[dict]] = {}
     for c in candles:
         dt = c["dt"]
@@ -984,13 +926,23 @@ def aggregate_4h(candles: list[dict]) -> list[dict]:
     return out
 
 
-def detect_sweep(candles: list[dict], i: int) -> dict | None:
-    """Объективная модель: sweep предыдущего N-bar high/low + возврат + EMA50."""
+def detect_sweep(candles: list[dict], i: int, emas: list[float | None], atrs: list[float | None]) -> dict | None:
+    """Объективная модель: sweep предыдущего N-bar high/low + возврат + EMA50.
+
+    ВАЖНО: emas/atrs передаются уже посчитанными на весь ряд заранее.
+    Раньше эта функция сама пересчитывала EMA/ATR по ВСЕМУ массиву при
+    каждом вызове — а backtest_sweeps вызывает её на каждую из тысяч свечей,
+    так что расчёт превращался в O(n²): пересчёт O(n) внутри цикла из n
+    итераций. На 5000 свечах это десятки миллионов операций на чистом
+    Python — синхронный CPU-bound код, который блокирует весь event loop
+    целиком (не только эту команду, а вообще всего бота), и именно поэтому
+    /signals "зависал" без вообще какого-либо ответа: asyncio.wait_for не
+    может прервать код, если у него нет ни одной точки await, где event loop
+    мог бы вклиниться и проверить дедлайн. Теперь emas/atrs считаются один
+    раз снаружи и просто передаются сюда — вся функция стала O(1) на вызов,
+    а весь бэктест — O(n) вместо O(n²)."""
     if i < max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD):
         return None
-    closes = [c["close"] for c in candles]
-    emas = _ema(closes, SIGNAL_EMA_PERIOD)
-    atrs = _atr(candles)
     c = candles[i]
     rng = c["high"] - c["low"]
     if rng <= 0 or emas[i] is None or atrs[i] is None:
@@ -1000,8 +952,6 @@ def detect_sweep(candles: list[dict], i: int) -> dict | None:
     prev_low = min(x["low"] for x in prev)
     close_pos = (c["close"] - c["low"]) / rng
 
-    # SHORT: забрали ликвидность сверху, вернулись под уровень, закрытие в нижних 45% свечи,
-    # и цена ниже EMA50 (фильтр направления).
     if c["high"] > prev_high and c["close"] < prev_high and close_pos <= 0.45 and c["close"] < emas[i]:
         entry = c["close"]
         stop = c["high"] + 0.10 * atrs[i]
@@ -1010,7 +960,6 @@ def detect_sweep(candles: list[dict], i: int) -> dict | None:
             return {"side": "SHORT", "level": prev_high, "extreme": c["high"], "entry": entry,
                     "stop": stop, "target": entry - SIGNAL_RR * risk, "risk": risk}
 
-    # LONG — зеркально.
     if c["low"] < prev_low and c["close"] > prev_low and close_pos >= 0.55 and c["close"] > emas[i]:
         entry = c["close"]
         stop = c["low"] - 0.10 * atrs[i]
@@ -1022,11 +971,16 @@ def detect_sweep(candles: list[dict], i: int) -> dict | None:
 
 
 def backtest_sweeps(candles: list[dict]) -> dict:
-    """Консервативный backtest: если SL и TP внутри одной свечи — считаем SL первым."""
+    """Консервативный backtest: если SL и TP внутри одной свечи — считаем SL первым.
+    EMA/ATR считаем один раз на весь ряд (не на каждую итерацию, см. detect_sweep)."""
+    closes = [c["close"] for c in candles]
+    emas = _ema(closes, SIGNAL_EMA_PERIOD)
+    atrs = _atr(candles)
+
     results = []
     start = max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD)
     for i in range(start, len(candles) - 1):
-        sig = detect_sweep(candles, i)
+        sig = detect_sweep(candles, i, emas, atrs)
         if not sig:
             continue
         outcome = None
@@ -1036,7 +990,7 @@ def backtest_sweeps(candles: list[dict]) -> dict:
                 stop_hit, tp_hit = b["low"] <= sig["stop"], b["high"] >= sig["target"]
             else:
                 stop_hit, tp_hit = b["high"] >= sig["stop"], b["low"] <= sig["target"]
-            if stop_hit:  # консервативно при одновременном касании
+            if stop_hit:
                 outcome = -1.0
                 break
             if tp_hit:
@@ -1089,13 +1043,13 @@ def load_signal_state() -> dict:
 
 
 def save_signal_state(state: dict) -> None:
-    # Не даём файлу бесконечно расти.
     state["sent"] = state.get("sent", [])[-500:]
     save_json(SIGNAL_STATE_FILE, state)
 
 
 async def scan_market_signals(send: bool = True) -> list[str]:
-    """Один проход по 4 инструментам. 4H строим локально, поэтому всего 4 API-запроса."""
+    """Один проход по 4 инструментам. EMA/ATR считаем один раз на серию
+    и переиспользуем и для live-проверки, и внутри backtest_sweeps."""
     if not TWELVE_DATA_API_KEY:
         return []
     state = load_signal_state()
@@ -1108,8 +1062,11 @@ async def scan_market_signals(send: bool = True) -> list[str]:
             for tf, candles in datasets.items():
                 if len(candles) < SIGNAL_EMA_PERIOD + 5:
                     continue
+                closes = [c["close"] for c in candles]
+                emas = _ema(closes, SIGNAL_EMA_PERIOD)
+                atrs = _atr(candles)
                 i = len(candles) - 1
-                sig = detect_sweep(candles, i)
+                sig = detect_sweep(candles, i, emas, atrs)
                 if not sig:
                     continue
                 key = f"{symbol}|{tf}|{candles[i]['dt'].isoformat()}|{sig['side']}"
@@ -1132,7 +1089,6 @@ async def market_signal_loop() -> None:
     if not TWELVE_DATA_API_KEY:
         logger.warning("TWELVE_DATA_API_KEY не задан — market scanner отключён")
         return
-    # Небольшая пауза после старта Railway, затем постоянный скан.
     await asyncio.sleep(10)
     while True:
         try:
@@ -1145,7 +1101,6 @@ async def market_signal_loop() -> None:
 # ---------- Постоянная клавиатура ----------
 
 def main_keyboard() -> ReplyKeyboardMarkup:
-    """Кнопки видны прямо под строкой ввода и не зависят от кэша меню Telegram."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📡 Сигналы"), KeyboardButton(text="🔮 Прогноз")],
@@ -1171,7 +1126,6 @@ async def on_start(message: Message) -> None:
 
 
 async def handle_signals_command(message: Message) -> None:
-    """Общий обработчик /signals. Отвечает ДО любых сетевых запросов."""
     logger.info("SIGNALS COMMAND RECEIVED chat_id=%s text=%r", message.chat.id, message.text)
     if not TWELVE_DATA_API_KEY:
         await message.answer("TWELVE_DATA_API_KEY не настроен — сканер сигналов выключен.")
@@ -1196,14 +1150,11 @@ async def handle_signals_command(message: Message) -> None:
             await message.answer(msg, parse_mode="HTML")
 
 
-# Кнопка «📡 Сигналы»
 @dp.message(F.text == "📡 Сигналы")
 async def on_signals_button(message: Message) -> None:
     await handle_signals_command(message)
 
 
-# Единственный обработчик slash-команды /signals.
-# Он отвечает сразу, до обращения к Twelve Data.
 @dp.message(Command("signals"))
 async def on_signals(message: Message) -> None:
     await handle_signals_command(message)
@@ -1329,10 +1280,6 @@ async def on_news(message: Message) -> None:
 
 
 async def gather_asset_context(question: str) -> tuple[str, list[str]]:
-    """Если в вопросе упоминается конкретный актив (BTC, индекс, валютная
-    пара) — подтягиваем по нему реальные цифры, чтобы Claude не отвечал
-    "у меня нет доступа к текущим данным", хотя данные у бота есть.
-    Возвращает (собранный текст, список ошибок получения данных)."""
     q = question.lower()
     parts = []
     errors = []
@@ -1385,8 +1332,6 @@ async def answer_question(message: Message, question: str) -> None:
         return
     asset_data, errors = await gather_asset_context(question)
     if errors and not asset_data:
-        # актив распознан, но получить данные не удалось — говорим прямо,
-        # а не позволяем Claude придумывать "у меня нет доступа"
         await message.answer("Не удалось получить актуальные данные: " + "; ".join(errors))
         return
     headlines = fetch_recent_headlines(limit=8)
@@ -1413,8 +1358,6 @@ async def on_ask(message: Message) -> None:
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_free_text(message: Message) -> None:
-    """Любое обычное сообщение (не команда) воспринимается как вопрос —
-    не нужно вспоминать команду /ask, можно просто написать."""
     await answer_question(message, message.text)
 
 
@@ -1447,9 +1390,6 @@ async def scheduler_loop() -> None:
                     trigger_at = ev["_dt"].astimezone(timezone.utc) - PRE_EVENT_LEAD
                     event_time = ev["_dt"].astimezone(timezone.utc)
                     if now_utc > event_time:
-                        # само событие уже прошло (например, рестарт контейнера
-                        # случился спустя часы) — слать "через час" задним
-                        # числом бессмысленно, просто помечаем как обработанное
                         state["notified_events"].append(ev["_id"])
                         save_state(state)
                     elif now_utc >= trigger_at:
@@ -1485,8 +1425,6 @@ async def scheduler_loop() -> None:
             else:
                 ny_now = datetime.now(NY_TZ)
                 if ny_now.weekday() >= 5:
-                    # суббота/воскресенье — биржа закрыта, не шлём вообще,
-                    # сразу помечаем день как обработанный
                     if not state["quiet_summary_sent"]:
                         state["quiet_summary_sent"] = True
                         save_state(state)
@@ -1494,11 +1432,8 @@ async def scheduler_loop() -> None:
                     market_open_ny = datetime.combine(ny_now.date(), NYSE_OPEN, tzinfo=NY_TZ)
                     trigger_at_ny = market_open_ny - PRE_NYSE_LEAD
                     if state["quiet_summary_sent"]:
-                        pass  # уже отправили сегодня, ничего не делаем
+                        pass
                     elif ny_now > market_open_ny:
-                        # окно пропущено (например, из-за рестарта контейнера
-                        # уже после открытия) — не шлём задним числом устаревшую
-                        # сводку, просто помечаем день закрытым
                         state["quiet_summary_sent"] = True
                         save_state(state)
                     elif ny_now >= trigger_at_ny:
@@ -1534,16 +1469,14 @@ BOT_COMMANDS = [
 ]
 
 
-
-
 async def main() -> None:
-    print("FOREXFX SIGNALS FIX BUILD 2026-09-28-2359", flush=True)
+    print("FOREXFX SIGNALS FIX BUILD (O(n) backtest)", flush=True)
     if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
         raise RuntimeError("Установите переменную окружения BOT_TOKEN")
     if not CLAUDE_ENABLED:
         logger.warning("ANTHROPIC_API_KEY не задан — бот работает без AI-анализа, только сырые данные")
-    # Force-refresh Telegram command menu on every deploy.
-    # This removes stale cached/default command definitions first.
+    if not TWELVE_DATA_API_KEY:
+        logger.warning("TWELVE_DATA_API_KEY не задан — сканер сигналов (/signals) будет отвечать, что выключен")
     try:
         await bot.delete_my_commands()
     except Exception:
