@@ -26,8 +26,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
   Oilprice, Kitco, MarketWatch, CNBC + пресс-релизы ФРС, ЕЦБ, Банка Англии.
 - Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
 - Цена BTC: Coinbase (без ключа).
-- Индексы (DAX 40, Nasdaq, S&P 500): 
-Yahoo Finance chart API (без ключа).
+- Индексы (DAX 40, Nasdaq, S&P 500): Yahoo Finance chart API (без ключа).
 - Позиционирование трейдеров: CFTC Commitment of Traders (раз в неделю).
 - Свечи для сканера сигналов: Twelve Data (НУЖЕН ключ, см. ниже).
 
