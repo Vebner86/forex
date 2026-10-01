@@ -13,7 +13,7 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
 4. /start подписывает на уведомления и сразу присылает сводку календаря на
    сегодня. /forecast, /btc, /pairs, /indices, /news, /ask — см. описания
    команд в BOT_COMMANDS ниже. /signals — сканер модели Liquidity Sweep +
-   Rejection по EUR/USD, GBP/USD, USD/JPY, XAU/USD на 1H/4H (требует
+   Rejection по EUR/USD, GBP/USD, USD/JPY, XAU/USD на 1H/4H/1D (требует
    TWELVE_DATA_API_KEY).
 
 Защита от устаревших фактов: у Claude есть дата отсечки обучающих данных —
@@ -26,7 +26,8 @@ Telegram-бот: форекс-сводка + прогнозы перед важ�
   Oilprice, Kitco, MarketWatch, CNBC + пресс-релизы ФРС, ЕЦБ, Банка Англии.
 - Курсы фиатных пар: Frankfurter.app (данные ЕЦБ, без ключа).
 - Цена BTC: Coinbase (без ключа).
-- Индексы (DAX 40, Nasdaq, S&P 500): Yahoo Finance chart API (без ключа).
+- Индексы (DAX 40, Nasdaq, S&P 500): 
+Yahoo Finance chart API (без ключа).
 - Позиционирование трейдеров: CFTC Commitment of Traders (раз в неделю).
 - Свечи для сканера сигналов: Twelve Data (НУЖЕН ключ, см. ниже).
 
@@ -85,12 +86,15 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 SIGNAL_SCAN_INTERVAL = 15 * 60  # API вызываем максимум раз в 15 минут
 SIGNAL_SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
-SIGNAL_TIMEFRAMES = ("1h", "4h")
+SIGNAL_TIMEFRAMES = ("1h", "4h", "1d")
+SIGNAL_HISTORY_DAYS = 200       # глубина бэктеста; 1H-свечей запрашиваем ровно на это окно
+SIGNAL_OUTPUTSIZE_1H = SIGNAL_HISTORY_DAYS * 24
 SIGNAL_LOOKBACK = 10            # sweep экстремума предыдущих 10 свечей
-SIGNAL_EMA_PERIOD = 50          # фильтр направления
+SIGNAL_EMA_PERIOD = 50          # для разметки "по силе" / "против силы", больше не фильтр
 SIGNAL_ATR_PERIOD = 14
 SIGNAL_RR = 2.0                 # историческая проверка TP = 2R
 SIGNAL_MAX_HOLD_BARS = 20       # максимум 20 свечей на исход сделки
+SIGNAL_MIN_HOUR_SAMPLES = 5     # не показывать PF по часу, если сделок меньше этого
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 RSS_FEEDS = [
@@ -879,7 +883,7 @@ def _atr(candles: list[dict], period: int = SIGNAL_ATR_PERIOD) -> list[float | N
     return out
 
 
-async def fetch_twelve_1h(symbol: str, outputsize: int = 5000) -> list[dict]:
+async def fetch_twelve_1h(symbol: str, outputsize: int = SIGNAL_OUTPUTSIZE_1H) -> list[dict]:
     if not TWELVE_DATA_API_KEY:
         raise RuntimeError("TWELVE_DATA_API_KEY не задан")
     params = {
@@ -926,21 +930,41 @@ def aggregate_4h(candles: list[dict]) -> list[dict]:
     return out
 
 
-def detect_sweep(candles: list[dict], i: int, emas: list[float | None], atrs: list[float | None]) -> dict | None:
-    """Объективная модель: sweep предыдущего N-bar high/low + возврат + EMA50.
+def aggregate_daily(candles: list[dict]) -> list[dict]:
+    """Дневные свечи из часовых. Форекс торгуется почти круглосуточно, но
+    воскресенье/праздники дают неполные дни — берём день, только если в нём
+    хотя бы 20 часовых свечей (не идеально строго, но достаточно, чтобы
+    отсечь явно неполные/праздничные дни)."""
+    groups: dict = {}
+    for c in candles:
+        d = c["dt"].date()
+        groups.setdefault(d, []).append(c)
+    out = []
+    for d in sorted(groups):
+        g = sorted(groups[d], key=lambda x: x["dt"])
+        if len(g) < 20:
+            continue
+        out.append({
+            "dt": datetime.combine(d, time(0, 0), tzinfo=timezone.utc),
+            "open": g[0]["open"], "high": max(x["high"] for x in g),
+            "low": min(x["low"] for x in g), "close": g[-1]["close"],
+        })
+    return out
 
-    ВАЖНО: emas/atrs передаются уже посчитанными на весь ряд заранее.
-    Раньше эта функция сама пересчитывала EMA/ATR по ВСЕМУ массиву при
-    каждом вызове — а backtest_sweeps вызывает её на каждую из тысяч свечей,
-    так что расчёт превращался в O(n²): пересчёт O(n) внутри цикла из n
-    итераций. На 5000 свечах это десятки миллионов операций на чистом
-    Python — синхронный CPU-bound код, который блокирует весь event loop
-    целиком (не только эту команду, а вообще всего бота), и именно поэтому
-    /signals "зависал" без вообще какого-либо ответа: asyncio.wait_for не
-    может прервать код, если у него нет ни одной точки await, где event loop
-    мог бы вклиниться и проверить дедлайн. Теперь emas/atrs считаются один
-    раз снаружи и просто передаются сюда — вся функция стала O(1) на вызов,
-    а весь бэктест — O(n) вместо O(n²)."""
+
+def detect_sweep(candles: list[dict], i: int, emas: list[float | None], atrs: list[float | None]) -> dict | None:
+    """Объективная модель: sweep предыдущего N-bar high/low + возврат.
+
+    ВАЖНО: emas/atrs передаются уже посчитанными на весь ряд заранее (не
+    пересчитываются на каждый вызов — иначе backtest_sweeps превращается в
+    O(n²) и блокирует весь event loop, см. историю багфикса ниже).
+
+    EMA50 больше НЕ фильтрует, какие сигналы отдавать — раньше сигнал против
+    тренда просто не показывался вообще. Теперь показываются оба варианта, но
+    помечаются полем trend_aligned: True — сделка по тренду ("по силе"),
+    False — против тренда ("против силы"). Дальше backtest_sweeps считает
+    историческую статистику для каждого варианта отдельно, чтобы было видно,
+    действительно ли контр-трендовые входы на этом инструменте хуже."""
     if i < max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD):
         return None
     c = candles[i]
@@ -952,32 +976,57 @@ def detect_sweep(candles: list[dict], i: int, emas: list[float | None], atrs: li
     prev_low = min(x["low"] for x in prev)
     close_pos = (c["close"] - c["low"]) / rng
 
-    if c["high"] > prev_high and c["close"] < prev_high and close_pos <= 0.45 and c["close"] < emas[i]:
+    if c["high"] > prev_high and c["close"] < prev_high and close_pos <= 0.45:
         entry = c["close"]
         stop = c["high"] + 0.10 * atrs[i]
         risk = stop - entry
         if risk > 0:
             return {"side": "SHORT", "level": prev_high, "extreme": c["high"], "entry": entry,
-                    "stop": stop, "target": entry - SIGNAL_RR * risk, "risk": risk}
+                    "stop": stop, "target": entry - SIGNAL_RR * risk, "risk": risk,
+                    "trend_aligned": c["close"] < emas[i]}
 
-    if c["low"] < prev_low and c["close"] > prev_low and close_pos >= 0.55 and c["close"] > emas[i]:
+    if c["low"] < prev_low and c["close"] > prev_low and close_pos >= 0.55:
         entry = c["close"]
         stop = c["low"] - 0.10 * atrs[i]
         risk = entry - stop
         if risk > 0:
             return {"side": "LONG", "level": prev_low, "extreme": c["low"], "entry": entry,
-                    "stop": stop, "target": entry + SIGNAL_RR * risk, "risk": risk}
+                    "stop": stop, "target": entry + SIGNAL_RR * risk, "risk": risk,
+                    "trend_aligned": c["close"] > emas[i]}
     return None
+
+
+def _stats_for(records: list[dict]) -> dict:
+    rs = [r["r"] for r in records]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r < 0]
+    gross_win, gross_loss = sum(wins), abs(sum(losses))
+    pf = gross_win / gross_loss if gross_loss else (999.0 if gross_win else 0.0)
+    equity = peak = max_dd = 0.0
+    for r in rs:
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    return {
+        "trades": len(rs), "win_rate": (100 * len(wins) / len(rs)) if rs else 0.0,
+        "pf": pf, "avg_r": (sum(rs) / len(rs)) if rs else 0.0, "max_dd_r": max_dd,
+    }
 
 
 def backtest_sweeps(candles: list[dict]) -> dict:
     """Консервативный backtest: если SL и TP внутри одной свечи — считаем SL первым.
-    EMA/ATR считаем один раз на весь ряд (не на каждую итерацию, см. detect_sweep)."""
+    EMA/ATR считаем один раз на весь ряд (не на каждую итерацию, см. detect_sweep).
+
+    Возвращает не одну цифру, а разбивку: общая статистика, отдельно для
+    сделок "по силе"/"против силы" (trend_aligned), и отдельно по часу входа
+    (UTC) — часы с < SIGNAL_MIN_HOUR_SAMPLES сделками не включаются, чтобы не
+    показывать статистику, которая на самом деле просто шум на маленькой
+    выборке."""
     closes = [c["close"] for c in candles]
     emas = _ema(closes, SIGNAL_EMA_PERIOD)
     atrs = _atr(candles)
 
-    results = []
+    records = []
     start = max(SIGNAL_LOOKBACK, SIGNAL_EMA_PERIOD, SIGNAL_ATR_PERIOD)
     for i in range(start, len(candles) - 1):
         sig = detect_sweep(candles, i, emas, atrs)
@@ -997,19 +1046,19 @@ def backtest_sweeps(candles: list[dict]) -> dict:
                 outcome = SIGNAL_RR
                 break
         if outcome is not None:
-            results.append(outcome)
-    wins = [r for r in results if r > 0]
-    losses = [r for r in results if r < 0]
-    gross_win, gross_loss = sum(wins), abs(sum(losses))
-    pf = gross_win / gross_loss if gross_loss else (999.0 if gross_win else 0.0)
-    equity = peak = max_dd = 0.0
-    for r in results:
-        equity += r
-        peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
+            records.append({"r": outcome, "trend_aligned": sig["trend_aligned"], "hour": candles[i]["dt"].hour})
+
+    by_hour = {}
+    for h in range(24):
+        recs_h = [r for r in records if r["hour"] == h]
+        if len(recs_h) >= SIGNAL_MIN_HOUR_SAMPLES:
+            by_hour[h] = _stats_for(recs_h)
+
     return {
-        "trades": len(results), "win_rate": (100 * len(wins) / len(results)) if results else 0.0,
-        "pf": pf, "avg_r": (sum(results) / len(results)) if results else 0.0, "max_dd_r": max_dd,
+        "overall": _stats_for(records),
+        "aligned": _stats_for([r for r in records if r["trend_aligned"]]),
+        "counter": _stats_for([r for r in records if not r["trend_aligned"]]),
+        "by_hour": by_hour,
     }
 
 
@@ -1021,21 +1070,37 @@ def _price(v: float, symbol: str) -> str:
     return f"{v:.5f}"
 
 
-def signal_message(symbol: str, tf: str, candle: dict, sig: dict, stats: dict) -> str:
+def signal_message(symbol: str, tf: str, candle: dict, sig: dict, bt: dict) -> str:
     side_emoji = "🟢" if sig["side"] == "LONG" else "🔴"
-    return (
-        f"{side_emoji} <b>{symbol} · {sig['side']} · {tf.upper()}</b>\n"
-        f"Модель: Liquidity Sweep + Rejection + EMA50\n"
-        f"Свеча: {candle['dt'].strftime('%Y-%m-%d %H:%M')} UTC\n"
-        f"Снят уровень: {_price(sig['level'], symbol)} | экстремум: {_price(sig['extreme'], symbol)}\n"
-        f"Закрытие / вход: <b>{_price(sig['entry'], symbol)}</b>\n\n"
-        f"🛑 SL: {_price(sig['stop'], symbol)}\n"
-        f"🎯 TP (2R): {_price(sig['target'], symbol)}\n\n"
-        f"📊 <b>История на загруженных свечах</b>\n"
-        f"Сделок: {stats['trades']} | Win rate: {stats['win_rate']:.1f}%\n"
-        f"PF: {stats['pf']:.2f} | Avg: {stats['avg_r']:+.2f}R | Max DD: {stats['max_dd_r']:.1f}R\n"
-        f"<i>Статистика не гарантирует будущий результат.</i>"
-    )
+    aligned_label = "✅ по силе (в тренд EMA50)" if sig["trend_aligned"] else "⚠️ против силы (контртренд)"
+
+    overall, aligned, counter = bt["overall"], bt["aligned"], bt["counter"]
+    lines = [
+        f"{side_emoji} <b>{symbol} · {sig['side']} · {tf.upper()}</b>",
+        aligned_label,
+        f"Свеча: {candle['dt'].strftime('%Y-%m-%d %H:%M')} UTC",
+        f"Снят уровень: {_price(sig['level'], symbol)} | экстремум: {_price(sig['extreme'], symbol)}",
+        f"Закрытие / вход: <b>{_price(sig['entry'], symbol)}</b>",
+        "",
+        f"🛑 SL: {_price(sig['stop'], symbol)}",
+        f"🎯 TP (2R): {_price(sig['target'], symbol)}",
+        "",
+        f"📊 <b>История за {SIGNAL_HISTORY_DAYS} дней</b>",
+        f"Всего: {overall['trades']} сделок, PF {overall['pf']:.2f}, WR {overall['win_rate']:.0f}%",
+        f"По силе: PF {aligned['pf']:.2f} ({aligned['trades']}) | Против силы: PF {counter['pf']:.2f} ({counter['trades']})",
+    ]
+
+    hour_stats = bt["by_hour"].get(candle["dt"].hour)
+    if hour_stats:
+        lines.append(
+            f"Вход в {candle['dt'].hour:02d}:00 UTC на этой модели: "
+            f"PF {hour_stats['pf']:.2f} ({hour_stats['trades']} сделок)"
+        )
+    else:
+        lines.append(f"Вход в {candle['dt'].hour:02d}:00 UTC: маловато истории для отдельной статистики")
+
+    lines.append("<i>Статистика не гарантирует будущий результат.</i>")
+    return "\n".join(lines)
 
 
 def load_signal_state() -> dict:
@@ -1048,8 +1113,10 @@ def save_signal_state(state: dict) -> None:
 
 
 async def scan_market_signals(send: bool = True) -> list[str]:
-    """Один проход по 4 инструментам. EMA/ATR считаем один раз на серию
-    и переиспользуем и для live-проверки, и внутри backtest_sweeps."""
+    """Один проход по 4 инструментам × 3 таймфрейма (1H/4H/1D). EMA/ATR
+    считаем один раз на серию и переиспользуем и для live-проверки, и внутри
+    backtest_sweeps. Теперь отдаём сигналы и по силе, и против силы — с
+    отдельной исторической статистикой для каждого варианта."""
     if not TWELVE_DATA_API_KEY:
         return []
     state = load_signal_state()
@@ -1058,7 +1125,7 @@ async def scan_market_signals(send: bool = True) -> list[str]:
     for symbol in SIGNAL_SYMBOLS:
         try:
             h1 = await fetch_twelve_1h(symbol)
-            datasets = {"1h": h1, "4h": aggregate_4h(h1)}
+            datasets = {"1h": h1, "4h": aggregate_4h(h1), "1d": aggregate_daily(h1)}
             for tf, candles in datasets.items():
                 if len(candles) < SIGNAL_EMA_PERIOD + 5:
                     continue
@@ -1072,8 +1139,8 @@ async def scan_market_signals(send: bool = True) -> list[str]:
                 key = f"{symbol}|{tf}|{candles[i]['dt'].isoformat()}|{sig['side']}"
                 if key in sent:
                     continue
-                stats = backtest_sweeps(candles)
-                msg = signal_message(symbol, tf, candles[i], sig, stats)
+                bt = backtest_sweeps(candles)
+                msg = signal_message(symbol, tf, candles[i], sig, bt)
                 found.append(msg)
                 if send:
                     await send_to_subscribers(msg)
@@ -1131,7 +1198,7 @@ async def handle_signals_command(message: Message) -> None:
         await message.answer("TWELVE_DATA_API_KEY не настроен — сканер сигналов выключен.")
         return
 
-    await message.answer("🔎 Команда /signals получена. Проверяю EUR/USD, GBP/USD, USD/JPY и XAU/USD на 1H/4H...")
+    await message.answer("🔎 Команда /signals получена. Проверяю EUR/USD, GBP/USD, USD/JPY и XAU/USD на 1H/4H/1D...")
     try:
         found = await asyncio.wait_for(scan_market_signals(send=False), timeout=90)
     except asyncio.TimeoutError:
@@ -1460,7 +1527,7 @@ async def scheduler_loop() -> None:
 BOT_COMMANDS = [
     BotCommand(command="start", description="Подписаться и получить сводку на сегодня"),
     BotCommand(command="forecast", description="Быстрый прогноз по валютам, золоту, нефти, индексам"),
-    BotCommand(command="signals", description="Проверить торговые сигналы 1H/4H"),
+    BotCommand(command="signals", description="Проверить торговые сигналы 1H/4H/1D"),
     BotCommand(command="pairs", description="Кнопки: анализ по валютной паре"),
     BotCommand(command="indices", description="Кнопки: DAX 40 / Nasdaq / S&P 500"),
     BotCommand(command="btc", description="Разбор биткоина: поддержка/сопротивление"),
